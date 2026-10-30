@@ -1,0 +1,229 @@
+
+
+#include <Servo.h>
+
+
+const byte SWITCH_PIN = 2;   
+const byte IR_PIN = 4;       
+const byte TRIG_PIN = 7;     
+const byte ECHO_PIN = 8;     
+const byte SERVO_PIN = 11;   
+const byte FORCE_PIN = A0;   
+
+
+const int HOME_ANGLE = 0;
+const int PICKUP_ANGLE = 100;
+const int MIN_SERVO_ANGLE = 0;
+const int MAX_SERVO_ANGLE = 120;
+
+const float OBJECT_DISTANCE_CM = 12.0;
+const int FORCE_THRESHOLD = 550;          
+const int FORCE_RELEASE_THRESHOLD = 450;  
+const unsigned long ECHO_TIMEOUT_US = 25000UL;
+const unsigned long SENSOR_INTERVAL_MS = 80;
+const unsigned long SERVO_STEP_INTERVAL_MS = 15;
+const unsigned long GRIP_SETTLE_MS = 700;
+
+
+const bool IR_ACTIVE_LOW = true;
+
+
+Servo armServo;
+
+enum ArmState {
+  DISABLED,
+  WAITING_FOR_OBJECT,
+  MOVING_TO_PICKUP,
+  GRIP_SETTLE,
+  HOLDING_OBJECT,
+  RETURNING_HOME
+};
+
+ArmState state = DISABLED;
+
+int currentAngle = HOME_ANGLE;
+int targetAngle = HOME_ANGLE;
+
+unsigned long lastSensorRead = 0;
+unsigned long lastServoStep = 0;
+unsigned long gripStartedAt = 0;
+
+float distanceCm = -1.0;
+int forceRaw = 0;
+bool irDetected = false;
+bool objectDetected = false;
+bool forceDetected = false;
+
+
+bool isEnabled() {
+    return digitalRead(SWITCH_PIN) == LOW;
+}
+
+float readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(3);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  const unsigned long duration = pulseIn(ECHO_PIN, HIGH, ECHO_TIMEOUT_US);
+  if (duration == 0) {
+    return -1.0;  
+  }
+  return duration * 0.0343f / 2.0f;
+}
+
+bool readIrDetected() {
+  const int reading = digitalRead(IR_PIN);
+  return IR_ACTIVE_LOW ? (reading == LOW) : (reading == HIGH);
+}
+
+int readForceRaw() {
+  return analogRead(FORCE_PIN);
+}
+
+void setTargetAngle(int angle) {
+  targetAngle = constrain(angle, MIN_SERVO_ANGLE, MAX_SERVO_ANGLE);
+}
+
+void printStatus() {
+  Serial.print(F("Switch="));
+  Serial.print(isEnabled() ? F("ON") : F("OFF"));
+
+  Serial.print(F(" | State="));
+  switch (state) {
+    case DISABLED:          Serial.print(F("DISABLED")); break;
+    case WAITING_FOR_OBJECT:Serial.print(F("WAITING_FOR_OBJECT")); break;
+    case MOVING_TO_PICKUP:  Serial.print(F("MOVING_TO_PICKUP")); break;
+    case GRIP_SETTLE:       Serial.print(F("GRIP_SETTLE")); break;
+    case HOLDING_OBJECT:    Serial.print(F("HOLDING_OBJECT")); break;
+    case RETURNING_HOME:    Serial.print(F("RETURNING_HOME")); break;
+  }
+
+  Serial.print(F(" | Distance="));
+  if (distanceCm < 0) {
+    Serial.print(F("no echo"));
+  } else {
+    Serial.print(distanceCm, 1);
+    Serial.print(F(" cm"));
+  }
+
+  Serial.print(F(" | IR="));
+  Serial.print(irDetected ? F("DETECTED") : F("CLEAR"));
+  Serial.print(F(" | Force ADC="));
+  Serial.println(forceRaw);
+}
+
+
+void setup() {
+  pinMode(SWITCH_PIN, INPUT_PULLUP);
+  pinMode(IR_PIN, INPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+
+  Serial.begin(115200);
+
+  armServo.attach(SERVO_PIN);
+  currentAngle = HOME_ANGLE;
+  armServo.write(currentAngle);
+
+  Serial.println(F("Arduino robot arm controller ready."));
+  Serial.println(F("Switch ON to enable; switch OFF returns arm home."));
+  Serial.println(F("Open Serial Monitor at 115200 baud to calibrate sensors."));
+
+}
+
+void loop() {
+
+  const unsigned long now = millis();
+
+
+  if (now - lastSensorRead >= SENSOR_INTERVAL_MS) {
+    lastSensorRead = now;
+
+    distanceCm = readDistanceCm();
+    forceRaw = readForceRaw();
+    irDetected = readIrDetected();
+
+    objectDetected =
+      (distanceCm >= 0.0f && distanceCm <= OBJECT_DISTANCE_CM) || irDetected;
+
+   
+    if (forceRaw >= FORCE_THRESHOLD) {
+      forceDetected = true;
+    } else if (forceRaw <= FORCE_RELEASE_THRESHOLD) {
+      forceDetected = false;
+    }
+
+    printStatus();
+  }
+
+  
+  if (!isEnabled()) {
+    if (state != DISABLED) {
+      state = RETURNING_HOME;
+      setTargetAngle(HOME_ANGLE);
+    }
+  } else if (state == DISABLED) {
+    state = WAITING_FOR_OBJECT;
+  }
+
+  if (isEnabled()) {
+    switch (state) {
+      case DISABLED:
+         break;
+
+      case WAITING_FOR_OBJECT:
+        if (objectDetected) {
+          state = MOVING_TO_PICKUP;
+          setTargetAngle(PICKUP_ANGLE);
+        }
+        break;
+
+      case MOVING_TO_PICKUP:
+       
+        if (forceDetected) {
+          setTargetAngle(currentAngle);
+          state = GRIP_SETTLE;
+          gripStartedAt = now;
+        } else if (!objectDetected) {
+          state = RETURNING_HOME;
+          setTargetAngle(HOME_ANGLE);
+        }
+        break;
+
+      case GRIP_SETTLE:
+        if (now - gripStartedAt >= GRIP_SETTLE_MS) {
+          state = HOLDING_OBJECT;
+        }
+        break;
+
+      case HOLDING_OBJECT:
+        if (!objectDetected && !forceDetected) {
+          state = RETURNING_HOME;
+          setTargetAngle(HOME_ANGLE);
+        }
+        break;
+
+      case RETURNING_HOME:
+        if (currentAngle == HOME_ANGLE) {
+          state = WAITING_FOR_OBJECT;
+        }
+        break;
+    }
+  }
+
+
+  if (now - lastServoStep >= SERVO_STEP_INTERVAL_MS) {
+    lastServoStep = now;
+
+    if (currentAngle < targetAngle) {
+      ++currentAngle;
+      armServo.write(currentAngle);
+    } else if (currentAngle > targetAngle) {
+      --currentAngle;
+      armServo.write(currentAngle);
+    }
+  }
+}
